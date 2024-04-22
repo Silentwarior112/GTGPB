@@ -85,7 +85,7 @@ gpb0: GT4 Prologue NTSC-J (PBPX-95523)
 gpb1: GT4 Prologue PAL (SCES-52438), GT4 First Preview (NTSC-J) (PCPX-96649)
 gpb2 (PS2): All retail releases of GT4, GT4 MX-5 Demo, Tourist Trophy
 gpb2 (PS3): GT HD, GT5 prologue
-gpb3: GT5, GT6
+gpb3: GTPSP, GT5, GT6
 
 gpb2 for PS3 is 99.9% identical to gpb2 for PS2, the only difference is the padding is written
 to the next factor of 128 instead of 16. However, I have tested factor of 16 padding on GT HD's
@@ -106,6 +106,8 @@ Gran Turismo 4: projects\arcade\US\alfaromeo.gpb
 		race_display\gt4\US\display.gpb
 
 Gran Turismo HD: race_display\ps3\US\display.gpb
+
+Gran Turismo PSP: projects\gt5m\race\US\QuickArcadeRoot.gpb
 
 Gran Turismo 6: projects\gt6\race\US\OnboardMeterRoot.gpb
 

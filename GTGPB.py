@@ -772,7 +772,12 @@ class AssetPackageGenerator(tk.Tk):
             
                 # Create directories if they don't exist
                 dir_path = os.path.dirname(extracted_filename)
-                dir_full_path = os.path.join(self.destination_dir, dir_path)
+                
+                # Add a forward slash if dir_path does not start with it
+                if not dir_path.startswith('/'):
+                    dir_path = '/' + dir_path
+                    
+                dir_full_path = f"{self.destination_dir}{dir_path}"
                 if not os.path.exists(dir_full_path):
                     os.makedirs(dir_full_path)
             
@@ -892,7 +897,12 @@ class AssetPackageGenerator(tk.Tk):
             
                 # Create directories if they don't exist
                 dir_path = os.path.dirname(extracted_filename)
-                dir_full_path = os.path.join(self.destination_dir, dir_path)
+                
+                # Add a forward slash if dir_path does not start with it
+                if not dir_path.startswith('/'):
+                    dir_path = '/' + dir_path
+                    
+                dir_full_path = f"{self.destination_dir}{dir_path}"
                 if not os.path.exists(dir_full_path):
                     os.makedirs(dir_full_path)
             
@@ -1012,7 +1022,12 @@ class AssetPackageGenerator(tk.Tk):
             
                 # Create directories if they don't exist
                 dir_path = os.path.dirname(extracted_filename)
-                dir_full_path = os.path.join(self.destination_dir, dir_path)
+                
+                # Add a forward slash if dir_path does not start with it
+                if not dir_path.startswith('/'):
+                    dir_path = '/' + dir_path
+                    
+                dir_full_path = f"{self.destination_dir}{dir_path}"
                 if not os.path.exists(dir_full_path):
                     os.makedirs(dir_full_path)
             
@@ -1130,12 +1145,17 @@ class AssetPackageGenerator(tk.Tk):
                 # Create directories if they don't exist
                 dir_path = os.path.dirname(extracted_filename)
                 
-                # This line here is different from the other extracting methods.
                 # os.path.join doesn't work because texture labels
-                # always start with a forward slash in a gpb3, so instead I append
-                # dir_path as a simple string. Honestly all of them should probably use this but idk.
+                # sometimes start with a forward slash and some don't in a gpb3, so instead I check
+                # for a forward slash first, if it's not there we add it so the logic doesn't get fucked.
+                # And then append dir_path as a simple string. Honestly all of them should probably use this but idk.
                 # In any case just make sure that any texture labels in a custom gpb or loose files
                 # don't use any anything other than letters, underscore, period sign, and forward slash to avoid having a bad time.
+                
+                # Add a forward slash if dir_path does not start with it
+                if not dir_path.startswith('/'):
+                    dir_path = '/' + dir_path
+                    
                 dir_full_path = f"{self.destination_dir}{dir_path}"
                 if not os.path.exists(dir_full_path):
                     os.makedirs(dir_full_path)
