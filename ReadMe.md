@@ -331,3 +331,4 @@ image/gt5/icon/icon_close.dds 00
 5E padding // pad until next factor of 64 in decimal / 80 in hex
 
 Repeat until end
+
