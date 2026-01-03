@@ -2,8 +2,8 @@ GTGPB By Silentwarior112: A Gran Turismo .gpb extractor and maker
 
 Features:
 1. Extract the .gpb asset packages that contain various UI / menu textures, and output a functional configuration file to generate them back into a .gpb.
-	GTGPB will dump the contents of the gpb, but will not perform any additional file format conversion, so you will still need
-	to handle the modification of the dumped file(s) with other tools.
+	GTGPB will dump the contents of the gpb, decompress any applicable files with PolyphonyPS2Zip, and convert any textures into PNG format with GTPS2ModelTool automatically.
+	This allows for an easy workflow free of any manual file conversions, GTGPB now handles it all with version 1.1.
 
 	Typical formats seen in a .gpb: Tex1 as .img (PS2-era GT games), TXS3 as .img (PS3-era GT games), etc.
 
@@ -13,21 +13,25 @@ Features:
 	must be in the correct order as well. If not, the game will not display it, so make sure the configuration file is set correctly.
 
 3. Update the file locations in an existing .gpb.
-	If you happen to move your asset folder to another location
-	on your computer, the configuration file will no longer
-	work, as it specifies the exact file location on your computer.
-	If this happens, you can use this function to update the file
-	locations in the configuration file.
-	
-	Make sure that the textures inside your asset folder
-	all match an existing texture label entry in the configuration
-	file first.
+	If you add or remove files from the asset folder, or move the folder to another location on your
+	computer, you will need to update the .ini configuration file in order to generate gpb files again.
+
+	Simply run the "Update GPB file entries" to fix the configuration file.
+	With version 1.1, the strict ASCII lexicographic file order is now handled correctly.
+	Currently it will set the compression flag to true for ALL files in the directory.
 
 How to use:
 1. If you do not have python installed on your computer, you will need to install it first (~26mb download).
 	https://www.python.org/downloads/
 
-2. Simply double-click the GTGPB.py file, and the GUI and console will load.
+2. Download the required external tools:
+	- [GTPS2ModelTool 1.1.0 or newer](https://github.com/Nenkai/GTPS2ModelTool/releases)
+	- [PolyphonyPS2Zip](https://github.com/pez2k/gt2tools/releases/tag/PolyphonyPS2Zip01)
+	- Any Microsoft dotnet frameworks that PolyphonyPS2Zip and GTPS2ModelTool require to run. (5.0 and 8.0)
+
+3. Place the tools in the corresponding folders to complete the installation.
+
+4. Simply double-click the GTGPB.py file, and the GUI and console will load.
 
 Extracting a .gpb:
 	Click the extract button, locate your .gpb, then specify the output folder
@@ -39,10 +43,13 @@ Extracting a .gpb:
 
 	All versions of gpb files are supported through this one button.
 
+	Version 1.1 has not updated the handling of gpb3 files.
+
 
 Modifying the asset folder:
-	Replace the original .img file(s) with your own, 
-	and make sure that its corresponding label in the config file is set correctly.
+	Replace the original file(s) with your own. Since textures are automatically converted,
+	you can edit the .png files directly and immediately generate a new .gpb to test.
+	When adding new files, update the GPB file entries then generate the new .gpb file.
 
 	For most situations, adhoc scripting is not modified, so you should only
 	extract the .gpb, overwrite the dumped files with your own, and generate the .gpb.
@@ -62,10 +69,10 @@ Modifying the asset folder:
 	string and path handling in the tool's code.
 
 Updating a configuration file:
-	Click the `Update file locations in .ini` button, select your asset folder location, 
-	and the tool will look for all files that match a texture
-	label entry in the config file, and update the file path(s) to the
-	new location(s) on your computer.
+	Click the "Update GPB file entries" button to generate a new configuration file,
+	it will be saved as "generated_config.ini".
+	With version 1.1, the strict ASCII lexicographic file order is now handled correctly.
+	Currently it will set the compression flag to true for ALL files in the directory.
 
 Generating a .gpb:
 	Click the generate button corresponding to your desired target gpb version.
