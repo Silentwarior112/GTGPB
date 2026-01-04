@@ -1787,11 +1787,12 @@ class AssetPackageGenerator(tk.Tk):
     
         entries = []
     
-        # Collect ALL PNG files
+        # Collect files
         for root, _, files in os.walk(root_folder):
             for file_name in files:
-                if not file_name.lower().endswith('.png'):
-                    continue
+                # Don't include the config
+                if file_name.lower().endswith('.ini'):
+                    continue # Skip
     
                 rel_dir = os.path.relpath(root, root_folder)
     
@@ -1803,10 +1804,14 @@ class AssetPackageGenerator(tk.Tk):
     
                 label = label.replace("\\", "/")
     
-                # Path must point to .img (same name, different extension)
-                img_name = os.path.splitext(file_name)[0] + ".img"
-                abs_path = os.path.abspath(os.path.join(root, img_name))
-                abs_path = abs_path.replace("\\", "/")
+                # Tex1's will be .img (same name, different extension)
+                if file_name.lower().endswith('.png'):
+                    img_name = os.path.splitext(file_name)[0] + ".img"
+                    abs_path = os.path.abspath(os.path.join(root, img_name))
+                    abs_path = abs_path.replace("\\", "/")
+                else:
+                    abs_path = os.path.abspath(os.path.join(root, file_name))
+                    abs_path = abs_path.replace("\\", "/")
     
                 entries.append((label, abs_path))
     
