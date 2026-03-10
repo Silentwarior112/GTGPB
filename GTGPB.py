@@ -1790,8 +1790,8 @@ class AssetPackageGenerator(tk.Tk):
         # Collect files
         for root, _, files in os.walk(root_folder):
             for file_name in files:
-                # Don't include the config
-                if file_name.lower().endswith('.ini'):
+                # Don't include the config or any shortcuts
+                if file_name.lower().endswith('.ini') or file_name.lower().endswith('.lnk'):
                     continue # Skip
     
                 rel_dir = os.path.relpath(root, root_folder)
@@ -1837,3 +1837,4 @@ class AssetPackageGenerator(tk.Tk):
 if __name__ == "__main__":
     app = AssetPackageGenerator()
     app.mainloop()
+
