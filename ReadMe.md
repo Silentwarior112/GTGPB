@@ -7,7 +7,7 @@ Features:
 
 	Typical formats seen in a .gpb: Tex1 as .img (PS2-era GT games), TXS3 as .img (PS3-era GT games), etc.
 
-2. Generate a .gpb with loose .img files using a configuration file.
+2. Generate a .gpb using a folder of loose files and a configuration file.
 	The configuration file will contain the path to your file(s), and their label that gets injected into the .gpb's header data.
 	The texture labels are REQUIRED to be exactly what the game's scripting logic is looking for, and the textures themselves
 	must be in the correct order as well. If not, the game will not display it, so make sure the configuration file is set correctly.
