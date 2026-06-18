@@ -1,6 +1,7 @@
 import os
+import glob
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import struct
 import configparser
 import subprocess
@@ -13,11 +14,94 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 GTPS2MODELTOOL_EXE = os.path.normpath(os.path.join(SCRIPT_DIR, "GTPS2ModelTool", "GTPS2ModelTool.exe"))
 
+TEXTURESETCONVERTER_EXE = os.path.normpath(os.path.join(SCRIPT_DIR, "TXS3Converter", "TextureSetConverter.exe"))
+
 zip_exe = os.path.normpath(os.path.join(SCRIPT_DIR, "PolyphonyPS2Zip", "PolyphonyPS2Zip.exe"))
     
 COMP_MAGIC = b"\xC5\xEE\xF7\xFF"
 
-# ChatGPT told me to put this here. Idk wtf I'm doing
+# TXS3 (PS3) texture-set magics - big-endian "TXS3" and little-endian "3SXT"
+TXS3_MAGICS = (b"TXS3", b"3SXT")
+
+# Tex1 (PS2) texture magic
+TEX1_MAGIC = b"Tex1"
+
+# On-disk extension for TXS3 texture data: input to `convert-png`, output of `convert-img`.
+TXS3_EXT = ".dds"
+
+
+# Texture container magics each GPB family knows how to decode into an editable image. A GPB can
+# hold ANY file, so an entry whose content magic isn't one of these is a non-texture and is dumped
+# verbatim (raw passthrough) under its exact label name, then packed back as-is on rebuild.
+TEX_MAGICS_PS2  = (TEX1_MAGIC,)                          # gpb0 / gpb1 (Tex1 only)
+TEX_MAGICS_GPB2 = (TEX1_MAGIC, b"TXS3", b"3SXT")         # gpb2 (Tex1 + PS3 TXS3)
+TEX_MAGICS_GPB3 = (b"TXS3", b"3SXT", b"Tpp1")            # gpb3 (TXS3 / 3SXT / Tpp1)
+
+
+def _is_txs3_flagged(path):
+    """True if a filename carries a ".CONTAINER.FORMAT" flag (TXS3 / 3SXT / Tpp1) before .png/.dds."""
+    parts = os.path.splitext(os.path.basename(path))[0].split('.')
+    return len(parts) >= 3 and parts[-2] in ("TXS3", "3SXT", "Tpp1")
+
+
+def _peek_magic(blob, tmp_dir):
+    """Content magic (first 4 bytes) of a GPB entry blob, decompressing a ps2zip wrapper first."""
+    if blob[:4] != COMP_MAGIC:
+        return blob[:4]
+    tmp = os.path.join(tmp_dir, "__gpb_peek.tmp")
+    dec = tmp + "_decompressed"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(blob)
+        subprocess.run([zip_exe, tmp], capture_output=True, text=True, check=True)
+        with open(dec, "rb") as fh:
+            return fh.read(4)
+    except Exception:
+        return blob[:4]
+    finally:
+        for _p in (tmp, dec):
+            try:
+                if os.path.isfile(_p):
+                    os.remove(_p)
+            except Exception:
+                pass
+
+
+def _build_kind(path, has_tex1=True):
+    """Classify a config ``texture_N_path`` for the rebuild:
+
+    'multi'   -> a ``<name>.txs`` folder (multi-texture TXS3 set)
+    'flagged' -> a ``name.CONTAINER.FORMAT.ext`` TXS3/3SXT/Tpp1 texture
+    'tex1'    -> a plain ``.png`` Tex1 source (PS2; only when ``has_tex1``)
+    'raw'     -> anything else: a non-texture file, packed into the GPB verbatim
+    """
+    bare = path.rstrip('/\\')
+    if bare.lower().endswith('.txs'):
+        return 'multi'
+    if _is_txs3_flagged(path):
+        return 'flagged'
+    if has_tex1 and path.lower().endswith('.png'):
+        return 'tex1'
+    return 'raw'
+
+
+def _texdata_path(src_path, has_tex1=True):
+    """On-disk texture-data file a config source converts to (what the rebuild actually packs).
+
+    Multi-texture set folder (.txs) -> the built ``.dds`` set. TXS3-flagged PNGs -> ``.dds`` (TXS3
+    binary); TXS3-flagged ``.dds`` inputs -> ``.txs3`` (convert-img would otherwise overwrite the
+    ``.dds`` source it reads). Plain ``.png`` Tex1 -> ``.img``. Raw passthrough files -> themselves.
+    """
+    kind = _build_kind(src_path, has_tex1=has_tex1)
+    if kind == 'multi':
+        return os.path.splitext(src_path.rstrip('/\\'))[0] + TXS3_EXT
+    if kind == 'flagged':
+        built_ext = ".txs3" if src_path.lower().endswith(".dds") else TXS3_EXT
+        return os.path.splitext(src_path)[0] + built_ext
+    if kind == 'tex1':
+        return os.path.splitext(src_path)[0] + ".img"
+    return src_path  # raw passthrough: pack verbatim
+
 def byte_count_to_bytes(byte_count):
     return byte_count.to_bytes(4, byteorder='big')  # Assuming a 4-byte integer
 
@@ -29,41 +113,95 @@ class AssetPackageGenerator(tk.Tk):
         # Load the last used directory from the configuration file
         self.last_used_directory = self.load_last_directory()
         
-        # Set window size
-        self.geometry("512x360")  # Width x Height
-    
         self.texture_names = []
         self.custom_filenames = {}  # Dictionary to hold texture labels
         self.destination_dir = None  # Destination directory for extraction
-        
-        # UI Components
-        frame_left = tk.Frame(self)
-        frame_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        frame_right = tk.Frame(self)
-        frame_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        
-        # Configure grid resizing
-        frame_left.grid_rowconfigure(1, weight=1)
-        frame_left.grid_columnconfigure(0, weight=1)
-        
-        frame_right.grid_rowconfigure(1, weight=1)
-        frame_right.grid_columnconfigure(0, weight=1)
-        
-        # Buttons
-        self.extract_button = tk.Button(self, text="Extract gpb to folder", command=self.on_extract_button_click)
-        self.extract_button.pack(padx=0, pady=30)
-        self.generate_button = tk.Button(self, text="Update GPB file entries", command=self.ask_root_folder_and_generate)
-        self.generate_button.pack(padx=10, pady=5)
-        self.generate_button = tk.Button(self, text="Generate gpb0 from .ini", command=self.generate_gpb0)
-        self.generate_button.pack(padx=10, pady=5)
-        self.generate_button = tk.Button(self, text="Generate gpb1 from .ini", command=self.generate_gpb1)
-        self.generate_button.pack(padx=10, pady=5)
-        self.generate_button = tk.Button(self, text="Generate gpb2 from .ini", command=self.generate_gpb2)
-        self.generate_button.pack(padx=10, pady=5)
-        self.generate_button = tk.Button(self, text="Generate gpb3 from .ini", command=self.generate_gpb3)
-        self.generate_button.pack(padx=10, pady=5)
-        
+
+        # ── UI ──────────────────────────────────────────────────────────────
+        # General actions at the top, then one "Generate" button per GPB variant,
+        # each under a section header naming the game(s) that use that format.
+        container = tk.Frame(self, padx=16, pady=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tk.Button(container, text="Extract gpb to folder",
+                  command=self.on_extract_button_click).pack(fill=tk.X, pady=(4, 4))
+        tk.Button(container, text="Update GPB file entries",
+                  command=self.ask_root_folder_and_generate).pack(fill=tk.X, pady=(0, 6))
+
+        def section(title):
+            ttk.Separator(container, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(8, 2))
+            tk.Label(container, text=title, font=("Segoe UI", 9, "bold"),
+                     fg="#444").pack(anchor=tk.W)
+
+        def gen_button(text, command):
+            tk.Button(container, text=text, command=command).pack(fill=tk.X, pady=2)
+
+        section("GPB0 — GT4P Japan")
+        gen_button("Generate gpb0 from .ini", self.generate_gpb0)
+
+        section("GPB1 — GT4P")
+        gen_button("Generate gpb1 from .ini", self.generate_gpb1)
+
+        section("GPB2 — GT4 & TT")
+        gen_button("Generate gpb2 from .ini", self.generate_gpb2)
+
+        section("PS3 GPB2 — GTHD & GT5P")
+        gen_button("Generate PS3 gpb2 from .ini", lambda: self.generate_gpb2(ps3=True))
+
+        section("GPB3 — GTPSP, GT5, GT6")
+        gen_button("Generate gpb3 from .ini", self.generate_gpb3)
+
+        # Size to fit the contents (with a comfortable minimum width), then centre on screen.
+        self.update_idletasks()
+        w = max(self.winfo_reqwidth(), 320)
+        h = self.winfo_reqheight()
+        self.geometry(f"{w}x{h}")
+        self.minsize(w, h)
+        self.center_window(self)
+
+    def center_window(self, win, over=None):
+        """Centre ``win`` over the ``over`` window if it's mapped, else on the screen.
+
+        Centring over the parent keeps modal dialogs on top of the app no matter where (or on
+        which monitor) the user has dragged it; the result is clamped to stay fully on-screen.
+        """
+        win.update_idletasks()
+        w = win.winfo_width() if win.winfo_width() > 1 else win.winfo_reqwidth()
+        h = win.winfo_height() if win.winfo_height() > 1 else win.winfo_reqheight()
+        # Centre over the parent's *frame* geometry (same coordinate system geometry() writes), so
+        # there's no window-decoration offset; fall back to the screen when the parent isn't placed.
+        x = y = None
+        if over is not None and over.winfo_ismapped():
+            mtch = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", over.geometry())
+            if mtch:
+                mw, mh, mx, my = map(int, mtch.groups())
+                x = mx + (mw - w) // 2
+                y = my + (mh - h) // 2
+        if x is None:
+            x = (win.winfo_screenwidth() - w) // 2
+            y = (win.winfo_screenheight() - h) // 2
+        # Keep the window fully on-screen.
+        x = max(0, min(x, win.winfo_screenwidth() - w))
+        y = max(0, min(y, win.winfo_screenheight() - h))
+        win.geometry(f"+{x}+{y}")
+
+    def show_progress_dialog(self, text="Working...\n\nPlease wait."):
+        """A centred modal 'working' dialog with an animated progress bar."""
+        dlg = tk.Toplevel(self)
+        dlg.withdraw()  # stay hidden until centred so it never flashes at the default corner
+        dlg.title("Working")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        tk.Label(dlg, text=text, padx=30).pack(pady=(20, 8))
+        bar = ttk.Progressbar(dlg, mode="indeterminate", length=260)
+        bar.pack(padx=30, pady=(0, 20))
+        self.center_window(dlg, over=self)  # position while hidden
+        dlg.deiconify()                      # now reveal it, already centred
+        dlg.grab_set()
+        dlg.lift()
+        bar.start(12)
+        return dlg
+
     def load_last_directory(self):
         config = configparser.ConfigParser()
         
@@ -133,22 +271,7 @@ class AssetPackageGenerator(tk.Tk):
             return
         output_gpb_path = output_gpb_file.name
     
-        def show_wait_dialog():
-            parent = self.winfo_toplevel()
-            dlg = tk.Toplevel(parent)
-            dlg.title("Working")
-            dlg.resizable(False, False)
-            dlg.transient(parent)
-            dlg.grab_set()
-            tk.Label(dlg, text="Converting textures...\n\nPlease wait.", padx=30, pady=20).pack()
-            dlg.update_idletasks()
-            dlg.update()
-            x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (dlg.winfo_width() // 2)
-            y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (dlg.winfo_height() // 2)
-            dlg.geometry(f"+{x}+{y}")
-            return dlg
-    
-        wait_dialog = show_wait_dialog()
+        wait_dialog = self.show_progress_dialog("Converting textures...\n\nPlease wait.")
     
         def worker():
             img_deletions = []
@@ -356,7 +479,7 @@ class AssetPackageGenerator(tk.Tk):
     
                 def on_success():
                     wait_dialog.destroy()
-                    messagebox.showinfo("Success!", f"GPB generation completed. {num_textures} textures packed.")
+                    messagebox.showinfo("Success!", f"GPB generation completed. {num_textures} files packed.")
                 self.after(0, on_success)
     
             except Exception as e:
@@ -386,22 +509,7 @@ class AssetPackageGenerator(tk.Tk):
             return
         output_gpb_path = output_gpb_file.name
     
-        def show_wait_dialog():
-            parent = self.winfo_toplevel()
-            dlg = tk.Toplevel(parent)
-            dlg.title("Working")
-            dlg.resizable(False, False)
-            dlg.transient(parent)
-            dlg.grab_set()
-            tk.Label(dlg, text="Converting textures...\n\nPlease wait.", padx=30, pady=20).pack()
-            dlg.update_idletasks()
-            dlg.update()
-            x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (dlg.winfo_width() // 2)
-            y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (dlg.winfo_height() // 2)
-            dlg.geometry(f"+{x}+{y}")
-            return dlg
-    
-        wait_dialog = show_wait_dialog()
+        wait_dialog = self.show_progress_dialog("Converting textures...\n\nPlease wait.")
     
         def worker():
             img_deletions = []
@@ -610,7 +718,7 @@ class AssetPackageGenerator(tk.Tk):
     
                 def on_success():
                     wait_dialog.destroy()
-                    messagebox.showinfo("Success!", f"GPB generation completed. {num_textures} textures packed.")
+                    messagebox.showinfo("Success!", f"GPB generation completed. {num_textures} files packed.")
                 self.after(0, on_success)
     
             except Exception as e:
@@ -626,7 +734,8 @@ class AssetPackageGenerator(tk.Tk):
     
         threading.Thread(target=worker, daemon=True).start()
 
-    def generate_gpb2(self):
+    # ps3 variable is set at button press. The PS3 GPB2 button passes ps3=True.
+    def generate_gpb2(self, ps3=False):
         # Ask user to select the gpb_config.ini file
         ini_file_path = filedialog.askopenfilename(
             title="Select gpb_config.ini File",
@@ -647,22 +756,7 @@ class AssetPackageGenerator(tk.Tk):
         output_gpb_path = output_gpb_file.name
     
         # Simple modal wait dialog (no counter/bar)
-        def show_wait_dialog():
-            parent = self.winfo_toplevel()
-            dlg = tk.Toplevel(parent)
-            dlg.title("Working")
-            dlg.resizable(False, False)
-            dlg.transient(parent)
-            dlg.grab_set()
-            tk.Label(dlg, text="Converting textures...\n\nPlease wait.", padx=30, pady=20).pack()
-            dlg.update_idletasks()
-            dlg.update()
-            x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (dlg.winfo_width() // 2)
-            y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (dlg.winfo_height() // 2)
-            dlg.geometry(f"+{x}+{y}")
-            return dlg
-    
-        wait_dialog = show_wait_dialog()
+        wait_dialog = self.show_progress_dialog("Converting textures...\n\nPlease wait.")
     
         def worker():
             img_deletions = []
@@ -701,57 +795,7 @@ class AssetPackageGenerator(tk.Tk):
     
             try:
                 # ---------------------------------------------------------
-                # PRE-STEP A: multithreaded conversion of ALL .png files
-                # Root = folder containing the ini file
-                # ---------------------------------------------------------
-                root_folder = os.path.dirname(ini_file_path)
-                png_files = []
-                for root, _, files in os.walk(root_folder):
-                    for fn in files:
-                        if fn.lower().endswith(".png"):
-                            png_files.append(os.path.join(root, fn))
-    
-                def run_make_tex_set(png_path: str):
-                    subprocess.run(
-                        [GTPS2MODELTOOL_EXE, "make-tex-set", "-i", png_path],
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    img_path = os.path.splitext(png_path)[0] + ".img"
-                    record_delete(img_deletions, img_path)
-    
-                max_workers = min(8, (os.cpu_count() or 4))
-                errors = []
-    
-                with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futures = {ex.submit(run_make_tex_set, p): p for p in png_files}
-                    for fut in as_completed(futures):
-                        p = futures[fut]
-                        try:
-                            fut.result()
-                        except subprocess.CalledProcessError as e:
-                            err = (e.stderr or e.stdout or "").strip()
-                            errors.append((p, err))
-                        except Exception as e:
-                            errors.append((p, str(e)))
-    
-                if errors:
-                    def on_fail():
-                        wait_dialog.destroy()
-                        print("GTPS2ModelTool make-tex-set errors:")
-                        for p, err in errors:
-                            print(f"- {p}\n  {err}\n")
-                        messagebox.showerror(
-                            "Conversion error",
-                            f"make-tex-set failed for {len(errors)} PNG file(s).\n"
-                            f"See console for details.\n\nAborting GPB generation."
-                        )
-                    self.after(0, on_fail)
-                    return
-    
-                # ---------------------------------------------------------
-                # Parse [Textures] entries in numeric order, including compression flag
+                # Parse [Textures] entries in numeric order (drives conversion + packing)
                 # ---------------------------------------------------------
                 config = configparser.ConfigParser()
                 config.read(ini_file_path)
@@ -761,10 +805,10 @@ class AssetPackageGenerator(tk.Tk):
                         messagebox.showerror("Error", "Missing [Textures] section in ini.")
                     self.after(0, on_fail2)
                     return
-    
+
                 tex = config['Textures']
                 pat = re.compile(r'^texture_(\d+)_(path|label|compression)$', re.IGNORECASE)
-    
+
                 items = {}
                 for k, v in tex.items():
                     m = pat.match(k)
@@ -773,7 +817,7 @@ class AssetPackageGenerator(tk.Tk):
                     idx = int(m.group(1))
                     field = m.group(2).lower()
                     items.setdefault(idx, {})[field] = v
-    
+
                 indices = sorted(items.keys())
                 if not indices:
                     def on_fail3():
@@ -781,11 +825,11 @@ class AssetPackageGenerator(tk.Tk):
                         messagebox.showerror("Error", "No texture_* entries found in [Textures].")
                     self.after(0, on_fail3)
                     return
-    
+
                 texture_paths = []
                 texture_labels = []
                 texture_comp = []
-    
+
                 for idx in indices:
                     entry = items[idx]
                     if 'path' not in entry or 'label' not in entry:
@@ -794,21 +838,78 @@ class AssetPackageGenerator(tk.Tk):
                             messagebox.showerror("Error", f"Missing path/label for texture_{idx}.")
                         self.after(0, on_missing)
                         return
-    
+
                     comp_raw = entry.get('compression', '0')
                     try:
                         comp_val = 1 if int(comp_raw) == 1 else 0
                     except Exception:
                         comp_val = 0
-    
+
                     texture_paths.append(entry['path'])
                     texture_labels.append(entry['label'])
                     texture_comp.append(comp_val)
-    
+
                 # ---------------------------------------------------------
-                # PRE-STEP B: PS2ZIP compress only flagged textures (.img -> .img.ps2zip)
+                # PRE-STEP A: convert each config entry to its on-disk texture data. Routing is by
+                # kind: flagged/.txs -> TextureSetConverter (TXS3), plain .png -> GTPS2ModelTool
+                # (Tex1), raw passthrough files are packed verbatim (no conversion).
                 # ---------------------------------------------------------
-                to_compress = [p for p, c in zip(texture_paths, texture_comp) if c == 1]
+                def run_make_tex_set(src_path: str):
+                    kind = _build_kind(src_path)
+                    if kind == 'raw':
+                        if not os.path.isfile(src_path):
+                            raise RuntimeError(f"Raw file not found:\n{src_path}")
+                        return  # packed verbatim, nothing to build
+                    if kind in ('flagged', 'multi'):
+                        subprocess.run(
+                            [TEXTURESETCONVERTER_EXE, "convert-img", "-i", src_path],
+                            capture_output=True, text=True, check=True
+                        )
+                    else:  # tex1
+                        subprocess.run(
+                            [GTPS2MODELTOOL_EXE, "make-tex-set", "-i", src_path],
+                            capture_output=True, text=True, check=True
+                        )
+                    out_path = _texdata_path(src_path)
+                    if not os.path.isfile(out_path):
+                        raise RuntimeError(f"Texture build did not produce expected output:\n{out_path}")
+                    record_delete(img_deletions, out_path)
+
+                max_workers = min(8, (os.cpu_count() or 4))
+                errors = []
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = {ex.submit(run_make_tex_set, p): p for p in texture_paths}
+                    for fut in as_completed(futures):
+                        p = futures[fut]
+                        try:
+                            fut.result()
+                        except subprocess.CalledProcessError as e:
+                            err = (e.stderr or e.stdout or "").strip()
+                            errors.append((p, err))
+                        except Exception as e:
+                            errors.append((p, str(e)))
+
+                if errors:
+                    def on_fail():
+                        wait_dialog.destroy()
+                        print("Texture conversion errors:")
+                        for p, err in errors:
+                            print(f"- {p}\n  {err}\n")
+                        messagebox.showerror(
+                            "Conversion error",
+                            f"Texture conversion failed for {len(errors)} file(s).\n"
+                            f"See console for details.\n\nAborting GPB generation."
+                        )
+                    self.after(0, on_fail)
+                    return
+
+                # Each config path maps to its built texture data (raw passthrough -> itself).
+                texture_data = [_texdata_path(p) for p in texture_paths]
+
+                # ---------------------------------------------------------
+                # PRE-STEP B: PS2ZIP compression
+                # ---------------------------------------------------------
+                to_compress = [d for d, c in zip(texture_data, texture_comp) if c == 1]
     
                 def run_ps2zip(img_path: str):
                     subprocess.run(
@@ -851,7 +952,7 @@ class AssetPackageGenerator(tk.Tk):
                     return
     
                 # ---------------------------------------------------------
-                # PACK GPB2 (same format), using .img.ps2zip when compression=1
+                # PACK GPB2
                 # ---------------------------------------------------------
                 num_textures = len(texture_paths)
     
@@ -873,37 +974,50 @@ class AssetPackageGenerator(tk.Tk):
                         filename_offsets.append(current_offset)
                         current_offset = f.tell()
     
-                    while f.tell() % 16 != 0:
+                    # PS3 gpb2 packs texture data on a 128-byte grid (PS2 uses 16) and records
+                    # the *padded* span (distance to the next texture, a multiple of 128) in the
+                    # metadata byte-count field at +8. PS2 leaves +8 zero. Matching the original PS3
+                    # layout matters: a zero byte-count / off-grid offset crashes the game.
+                    
+                    # ps3 variable is set at button press. The PS3 GPB2 button passes ps3=True.
+                    data_align = 128 if ps3 else 16
+                    while f.tell() % data_align != 0:
                         f.write(b'\x5E')
-    
+
                     texture_offsets = []
-                    for path, comp_val in zip(texture_paths, texture_comp):
+                    byte_counts = []
+                    for path, comp_val in zip(texture_data, texture_comp):
                         pack_path = (path + ".ps2zip") if comp_val == 1 else path
                         with open(pack_path, 'rb') as img_file:
                             img_data = img_file.read()
-    
+
                         texture_offset = f.tell()
                         f.write(img_data)
-    
-                        while f.tell() % 16 != 0:
+
+                        while f.tell() % data_align != 0:
                             f.write(b'\x5E')
-    
+
                         texture_offsets.append(texture_offset)
-    
+                        byte_counts.append(f.tell() - texture_offset)  # padded span
+
                     for i in range(num_textures):
                         f.seek(metadata_start + i * 16)
                         f.write(struct.pack('<I', filename_offsets[i]))
                         f.seek(metadata_start + 4 + i * 16)
                         f.write(struct.pack('<I', texture_offsets[i]))
                         f.seek(metadata_start + 8 + i * 16)
-                        f.write(b'\x00' * 8)
+                        if ps3:
+                            f.write(struct.pack('<I', byte_counts[i]))  # byte-count @+8
+                            f.write(b'\x00' * 4)                        # field @+12 = 0
+                        else:
+                            f.write(b'\x00' * 8)
     
-                # Cleanup at end
+                # Cleanup
                 cleanup_recorded()
     
                 def on_success():
                     wait_dialog.destroy()
-                    messagebox.showinfo("Success!", f"GPB generation completed. {num_textures} textures packed.")
+                    messagebox.showinfo("Success!", f"GPB generation completed. {num_textures} files packed.")
                 self.after(0, on_success)
     
             except Exception as e:
@@ -995,9 +1109,44 @@ class AssetPackageGenerator(tk.Tk):
             return
     
         num_textures = len(texture_paths)
-    
+
+        # PRE-STEP: convert each texture PNG to its on-disk texture data. The PNG filename carries
+        # a ".CONTAINER.FORMAT" flag (e.g. texture_name.3SXT.IDTEX8.png), so the converter reproduces the
+        # exact original container + pixel format with no -f/--pf needed
+        wait_dialog = self.show_progress_dialog("Converting textures...\n\nPlease wait.")
+        gpb3_generated = []
+        texture_dds = []
+        conv_error = None
+        for _png in texture_paths:
+            wait_dialog.update()
+            # Non-texture entries (no flag, not a .txs set) are packed verbatim - GPBs hold any file.
+            if _build_kind(_png, has_tex1=False) == 'raw':
+                if not os.path.isfile(_png):
+                    conv_error = f"Raw file not found:\n{_png}"
+                    break
+                texture_dds.append(_png)
+                continue
+            try:
+                subprocess.run([TEXTURESETCONVERTER_EXE, "convert-img", "-i", _png],
+                               capture_output=True, text=True, check=True)
+            except subprocess.CalledProcessError as e:
+                err = (e.stderr or e.stdout or "").strip()
+                conv_error = f"Texture conversion failed for:\n{_png}\n\n{err}"
+                break
+            _out = _texdata_path(_png, has_tex1=False)
+            if not os.path.isfile(_out):
+                conv_error = f"Converter did not produce expected output:\n{_out}"
+                break
+            gpb3_generated.append(_out)
+            texture_dds.append(_out)
+
+        if conv_error:
+            wait_dialog.destroy()
+            messagebox.showerror("Conversion error", conv_error)
+            return
+
         with open(output_gpb_path, "wb") as f:
-            # Step 1: haha PD forgot that PS3 is Big-endian
+            # Step 1: Magic
             f.write(b'3bpg')
             f.write(b'\x00' * 4)
             
@@ -1043,28 +1192,29 @@ class AssetPackageGenerator(tk.Tk):
     
                 current_offset = f.tell()  # Update the current offset after writing each filename
     
-            # Pad to 0x00000100, or if already above that, pad to next factor of 64
+            # First texture starts at align(nameEnd, 128) (PD's rule across all gpb3; 64-align here
+            # put it at e.g. 0x1c0 instead of 0x200), with a 0x100 floor. Subsequent textures are
+            # 128-padded below, so this keeps the whole texture region on a 128-byte grid.
             current_pos = f.tell()
-            next_factor_of_64 = (current_pos + 63) // 64 * 64
-            padding_needed = max(0x00000100 - current_pos, next_factor_of_64 - current_pos)
+            next_factor_of_128 = (current_pos + 127) // 128 * 128
+            padding_needed = max(0x00000100 - current_pos, next_factor_of_128 - current_pos)
             while padding_needed > 0:
                 bytes_to_write = min(padding_needed, 16)  # Write up to 16 bytes at a time
                 f.write(b'\x5E' * bytes_to_write)
                 padding_needed -= bytes_to_write
     
-            # Step 6: Insert the user's inputted texture files into the gpb file
+            # Step 6: Insert the files into the gpb file
             texture_offsets = []
             byte_counts = []
-            
-            for path in texture_paths:
+
+            for path in texture_dds:
                 with open(path, 'rb') as img_file:
                     img_data = img_file.read()
             
-                    # Write texture data and get its offset
+                    # Write file data and get its offset
                     texture_offset = f.tell()  # offset
                     f.write(img_data)  # read the .img file
                     
-                    # padding again because I suck at programming
                     while f.tell() % 128 != 0:
                         f.write(b'\x5E')
                         
@@ -1096,7 +1246,7 @@ class AssetPackageGenerator(tk.Tk):
                 f_step8.seek(0x00000018)
                 f_step8.write(data)
                     
-            #Final padding to the next factor of 64
+            # Final padding to the next factor of 64
             current_pos = f.tell()
             next_factor_of_64 = (current_pos + 63) // 64 * 64
             padding_needed = next_factor_of_64 - current_pos
@@ -1105,7 +1255,16 @@ class AssetPackageGenerator(tk.Tk):
             with open(output_gpb_path, "ab") as f:
                 f.write(b'\x5E' * padding_needed)
             
-            messagebox.showinfo("Success!", f"GPB generation completed. {num_textures} textures packed.")
+            # Cleanup texture files generated from PNGs in the pre-step
+            for _p in gpb3_generated:
+                try:
+                    if os.path.isfile(_p):
+                        os.remove(_p)
+                except Exception as e:
+                    print(f"[Cleanup] Failed to delete: {_p}\n  {e}")
+
+            wait_dialog.destroy()
+            messagebox.showinfo("Success!", f"GPB generation completed. {num_textures} files packed.")
 
     def extract_gpb0(self, gpb_path):
         if not self.destination_dir:
@@ -1173,7 +1332,9 @@ class AssetPackageGenerator(tk.Tk):
     
             extracted_labels = []     # original labels from GPB
             compression_flags = []    # 0/1 per texture
-    
+            entry_info = []           # 'tex' or 'raw' per entry, in GPB order
+            tex_scratch = []          # Tex1 .img scratch files to dump -> PNG
+
             # Step 3: Extract all files first
             for i in range(num_textures):
                 filename_offset = int.from_bytes(metadata[i*8:i*8+4], byteorder='little')
@@ -1196,82 +1357,70 @@ class AssetPackageGenerator(tk.Tk):
                 os.makedirs(dir_full_path, exist_ok=True)
     
                 base = os.path.basename(label)
-    
-                # Export name rules:
-                # - if label ends .png => replace to .img
-                # - else => append .img (keeps old behavior)
-                if base.lower().endswith(".png"):
-                    exported_filename = os.path.splitext(base)[0] + ".img"
-                else:
-                    exported_filename = base + ".img"
-    
+
                 # Determine end boundary
                 # (keep your metadata indexing style; key fix is: do NOT trim 0x5E)
                 next_texture_offset = int.from_bytes(metadata[i*8+12:i*8+16], byteorder='little')
-    
+
                 if next_texture_offset == 0:
                     last_byte_address = os.path.getsize(gpb_path)
                 else:
                     last_byte_address = next_texture_offset
-    
+
                 # Extract bytes
                 f.seek(texture_offset)
                 img_data = f.read(last_byte_address - texture_offset)
-    
-                compression_flags.append(1 if img_data[:4] == COMP_MAGIC else 0)
-    
-                output_path = os.path.join(dir_full_path, exported_filename)
-                with open(output_path, 'wb') as out_file:
-                    out_file.write(img_data)
-    
-            # Step 4: Write config (path=.img, label=original)
+
+                # A GPB holds any file. Tex1 (PS2) textures convert to PNG; anything else is dumped
+                # verbatim under its exact label name (raw passthrough), packed back as-is on rebuild.
+                magic = _peek_magic(img_data, self.destination_dir)
+                if magic in TEX_MAGICS_PS2:
+                    scratch = os.path.join(dir_full_path, os.path.splitext(base)[0] + ".img")
+                    with open(scratch, 'wb') as out_file:
+                        out_file.write(img_data)
+                    compression_flags.append(1 if img_data[:4] == COMP_MAGIC else 0)
+                    tex_scratch.append(scratch)
+                    entry_info.append('tex')
+                    print(f"[Texture] '{base}'")
+                else:
+                    raw_path = os.path.join(dir_full_path, base)
+                    with open(raw_path, 'wb') as out_file:
+                        out_file.write(img_data)
+                    compression_flags.append(0)
+                    entry_info.append('raw')
+                    print(f"[File] '{base}'")
+
+            # Step 4: Write config (path = built .img for Tex1, the verbatim file for raw; label=original)
             config = configparser.ConfigParser()
             config.add_section('Textures')
-    
+
             for idx, label in enumerate(extracted_labels, start=1):
                 label_norm = label.replace("\\", "/")
-    
-                # path should point to .img (label stays same)
-                path_name = label
-                if path_name.lower().endswith(".png"):
-                    path_name = os.path.splitext(path_name)[0] + ".img"
+
+                if entry_info[idx-1] == 'raw':
+                    path_name = label                                  # verbatim file = label name
                 else:
-                    path_name = path_name + ".img"
-    
+                    path_name = os.path.splitext(label)[0] + ".img"    # built Tex1 binary
+
                 full_path = os.path.join(self.destination_dir, path_name).replace("\\", "/")
-    
+
                 config.set('Textures', f'texture_{idx}_path', full_path)
                 config.set('Textures', f'texture_{idx}_label', label_norm)
                 config.set('Textures', f'texture_{idx}_compression', str(compression_flags[idx-1]))
-    
+
             config_file_path = os.path.join(self.destination_dir, 'gpb0_config.ini')
             with open(config_file_path, 'w', encoding='utf-8') as config_file:
                 config.write(config_file)
-    
-        # Step 5: Convert all .img -> .png after config
-        img_files = []
-        for root, _, files in os.walk(self.destination_dir):
-            for fn in files:
-                if fn.lower().endswith('.img'):
-                    img_files.append(os.path.join(root, fn))
-    
-        parent = tk._default_root
-        wait_dialog = tk.Toplevel(parent)
-        wait_dialog.title("Working")
-        wait_dialog.resizable(False, False)
-        wait_dialog.transient(parent)
-        wait_dialog.grab_set()
-        tk.Label(wait_dialog, text="Converting textures to PNG...\n\nPlease wait.", padx=30, pady=20).pack()
-        wait_dialog.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() // 2) - (wait_dialog.winfo_width() // 2)
-        y = parent.winfo_y() + (parent.winfo_height() // 2) - (wait_dialog.winfo_height() // 2)
-        wait_dialog.geometry(f"+{x}+{y}")
-    
+
+        # Step 5: Convert the Tex1 .img scratch files -> .png (raw passthrough entries are final)
+        wait_dialog = self.show_progress_dialog("Converting textures to PNG...\n\nPlease wait.")
+
         max_workers = min(8, (os.cpu_count() or 4))
         errors = []
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(run_dump, p): p for p in img_files}
+            futures = {ex.submit(run_dump, p): p for p in tex_scratch}
             for fut in as_completed(futures):
+                wait_dialog.update()  # animate the progress bar as each texture finishes
                 p = futures[fut]
                 try:
                     fut.result()
@@ -1346,7 +1495,9 @@ class AssetPackageGenerator(tk.Tk):
     
             extracted_labels = []
             compression_flags = []
-    
+            entry_info = []           # 'tex' or 'raw' per entry, in GPB order
+            tex_scratch = []          # Tex1 .img scratch files to dump -> PNG
+
             for i in range(num_textures):
                 filename_offset = int.from_bytes(metadata[(i*8):(i*8)+4], byteorder='little')
                 texture_offset  = int.from_bytes(metadata[(i*8)+4:(i*8)+8], byteorder='little')
@@ -1366,71 +1517,64 @@ class AssetPackageGenerator(tk.Tk):
                 os.makedirs(dir_full_path, exist_ok=True)
     
                 base = os.path.basename(label)
-                if base.lower().endswith(".png"):
-                    exported_filename = os.path.splitext(base)[0] + ".img"
-                else:
-                    exported_filename = base + ".img"
-    
+
                 next_texture_offset = int.from_bytes(metadata[(i*8)+12:(i*8)+16], byteorder='little')
                 if next_texture_offset == 0:
                     last_byte_address = os.path.getsize(gpb_path)
                 else:
                     last_byte_address = next_texture_offset  # do NOT trim 0x5E
-    
+
                 f.seek(texture_offset)
                 img_data = f.read(last_byte_address - texture_offset)
-    
-                compression_flags.append(1 if img_data[:4] == COMP_MAGIC else 0)
-    
-                output_path = os.path.join(dir_full_path, exported_filename)
-                with open(output_path, 'wb') as out_file:
-                    out_file.write(img_data)
-    
+
+                # A GPB holds any file. Tex1 (PS2) textures convert to PNG; anything else is dumped
+                # verbatim under its exact label name (raw passthrough), packed back as-is on rebuild.
+                magic = _peek_magic(img_data, self.destination_dir)
+                if magic in TEX_MAGICS_PS2:
+                    scratch = os.path.join(dir_full_path, os.path.splitext(base)[0] + ".img")
+                    with open(scratch, 'wb') as out_file:
+                        out_file.write(img_data)
+                    compression_flags.append(1 if img_data[:4] == COMP_MAGIC else 0)
+                    tex_scratch.append(scratch)
+                    entry_info.append('tex')
+                    print(f"[Texture] '{base}'")
+                else:
+                    raw_path = os.path.join(dir_full_path, base)
+                    with open(raw_path, 'wb') as out_file:
+                        out_file.write(img_data)
+                    compression_flags.append(0)
+                    entry_info.append('raw')
+                    print(f"[File] '{base}'")
+
             config = configparser.ConfigParser()
             config.add_section('Textures')
-    
+
             for idx, label in enumerate(extracted_labels, start=1):
                 label_norm = label.replace("\\", "/")
-    
-                path_name = label
-                if path_name.lower().endswith(".png"):
-                    path_name = os.path.splitext(path_name)[0] + ".img"
+
+                if entry_info[idx-1] == 'raw':
+                    path_name = label                                  # verbatim file = label name
                 else:
-                    path_name = path_name + ".img"
-    
+                    path_name = os.path.splitext(label)[0] + ".img"    # built Tex1 binary
+
                 full_path = os.path.join(self.destination_dir, path_name).replace("\\", "/")
-    
+
                 config.set('Textures', f'texture_{idx}_path', full_path)
                 config.set('Textures', f'texture_{idx}_label', label_norm)
                 config.set('Textures', f'texture_{idx}_compression', str(compression_flags[idx-1]))
-    
+
             config_file_path = os.path.join(self.destination_dir, 'gpb1_config.ini')
             with open(config_file_path, 'w', encoding='utf-8') as config_file:
                 config.write(config_file)
-    
-        img_files = []
-        for root, _, files in os.walk(self.destination_dir):
-            for fn in files:
-                if fn.lower().endswith('.img'):
-                    img_files.append(os.path.join(root, fn))
-    
-        parent = tk._default_root
-        wait_dialog = tk.Toplevel(parent)
-        wait_dialog.title("Working")
-        wait_dialog.resizable(False, False)
-        wait_dialog.transient(parent)
-        wait_dialog.grab_set()
-        tk.Label(wait_dialog, text="Converting textures to PNG...\n\nPlease wait.", padx=30, pady=20).pack()
-        wait_dialog.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() // 2) - (wait_dialog.winfo_width() // 2)
-        y = parent.winfo_y() + (parent.winfo_height() // 2) - (wait_dialog.winfo_height() // 2)
-        wait_dialog.geometry(f"+{x}+{y}")
-    
+
+        wait_dialog = self.show_progress_dialog("Converting textures to PNG...\n\nPlease wait.")
+
         max_workers = min(8, (os.cpu_count() or 4))
         errors = []
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(run_dump, p): p for p in img_files}
+            futures = {ex.submit(run_dump, p): p for p in tex_scratch}
             for fut in as_completed(futures):
+                wait_dialog.update()  # animate the progress bar as each texture finishes
                 p = futures[fut]
                 try:
                     fut.result()
@@ -1459,17 +1603,46 @@ class AssetPackageGenerator(tk.Tk):
             messagebox.showerror("Error", "No destination directory selected.")
             return
     
-        def run_dump(img_path: str):
+        def safe_rel_path(label):
+            # Map a GPB label to a path that stays INSIDE destination_dir.
+            # GT PS3 labels often start with ../../../ which would otherwise escape the
+            # output folder (so os.walk never finds the files to convert). Strip drive
+            # letters, leading slashes, and any '.'/'..' components.
+            s = label.replace("\\", "/")
+            parts = [p for p in s.split("/") if p not in ("", ".", "..") and ":" not in p]
+            return os.path.join(*parts) if parts else "_unnamed_"
+    
+        def peek_format_magic(blob):
+            # Return the 4-byte texture magic; decompress first if ps2zip-compressed.
+            if blob[:4] != COMP_MAGIC:
+                return blob[:4]
+            tmp_path = os.path.join(self.destination_dir, "__gpb_peek.tmp")
+            dec_path = tmp_path + "_decompressed"
+            try:
+                with open(tmp_path, "wb") as fh:
+                    fh.write(blob)
+                subprocess.run([zip_exe, tmp_path], capture_output=True, text=True, check=True)
+                with open(dec_path, "rb") as fh:
+                    return fh.read(4)
+            finally:
+                for _p in (tmp_path, dec_path):
+                    try:
+                        if os.path.isfile(_p):
+                            os.remove(_p)
+                    except Exception:
+                        pass
+    
+        def run_dump(img_path: str, as_dds: bool = False):
             # Check compression magic
             try:
                 with open(img_path, "rb") as fh:
                     magic = fh.read(4)
             except Exception as e:
                 raise RuntimeError(f"Failed reading magic for: {img_path}\n{e}")
-        
+
             dump_input = img_path
             decompressed_path = None
-        
+
             # 1) Decompress if needed
             if magic == COMP_MAGIC:
                 subprocess.run(
@@ -1478,18 +1651,32 @@ class AssetPackageGenerator(tk.Tk):
                     text=True,
                     check=True
                 )
-        
+
                 decompressed_path = img_path + "_decompressed"
                 dump_input = decompressed_path
-        
+
                 if not os.path.isfile(decompressed_path):
                     raise RuntimeError(
                         f"PolyphonyPS2Zip did not produce expected output:\n{decompressed_path}"
                     )
-        
-            # 2) Convert to PNG
-            subprocess.run([GTPS2MODELTOOL_EXE, "dump", "-i", dump_input],
-                        capture_output=True, text=True, check=True)
+
+            # 2) Convert to PNG (route by texture format: TXS3 magic or .dds extension)
+            if magic == COMP_MAGIC:
+                with open(dump_input, "rb") as _fh:
+                    inner_magic = _fh.read(4)
+            else:
+                inner_magic = magic
+
+            if inner_magic in TXS3_MAGICS or img_path.lower().endswith(TXS3_EXT):
+                # TXS3 (PS3) -> PNG, or DDS when the label was a .dds (lossless DXT round-trip).
+                cmd = [TEXTURESETCONVERTER_EXE, "convert-png", "-i", dump_input, "-f", "PS3"]
+                if as_dds:
+                    cmd.append("--dds")
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+            else:
+                # Tex1 (.img) -> PNG via GTPS2ModelTool
+                subprocess.run([GTPS2MODELTOOL_EXE, "dump", "-i", dump_input],
+                            capture_output=True, text=True, check=True)
         
             # 3) Cleanup (ONLY after successful dump)
             try:
@@ -1518,9 +1705,10 @@ class AssetPackageGenerator(tk.Tk):
             metadata = f.read(metadata_end - metadata_start)
     
             extracted_filenames = []   # original filenames from GPB (labels)
-            written_img_paths = []     # actual .img files written to disk (for dumping)
             compression_flags = []  # 0/1 aligned to extracted_filenames order
-    
+            dump_jobs = []          # (scratch path, as_dds) per texture entry to convert
+            entry_info = []         # ('tex', None) or ('raw', raw_path) per entry, in GPB order
+
             # 1) EXTRACT ALL FILES FIRST (no subprocess here)
             for i in range(num_textures):
                 filename_offset = int.from_bytes(metadata[i*16:i*16+4], byteorder='little')
@@ -1537,18 +1725,14 @@ class AssetPackageGenerator(tk.Tk):
                 extracted_filename = filename_bytes.decode('utf-8')
                 extracted_filenames.append(extracted_filename)
     
-                # Create output directories
-                dir_path = os.path.dirname(extracted_filename)
-                dir_full_path = os.path.join(self.destination_dir, dir_path)
+                # Create output directories (sanitized so files stay inside destination_dir)
+                rel_path = safe_rel_path(extracted_filename)
+                dir_full_path = os.path.join(self.destination_dir, os.path.dirname(rel_path))
                 os.makedirs(dir_full_path, exist_ok=True)
     
-                name = os.path.basename(extracted_filename)
+                name = os.path.basename(rel_path)
     
-                # Write output file:
-                # If GPB label ends in .png, write it as .img (replace ext, don't append)
-                exported_filename = name
-                if name.lower().endswith('.png'):
-                    exported_filename = os.path.splitext(name)[0] + '.img'
+                # (Texture format is detected by magic after the blob is read, below.)
     
                 # Determine byte range for data (keeping your existing logic)
                 # NOTE: Your original next_texture_offset indexing looks suspicious (i*16+20),
@@ -1558,86 +1742,57 @@ class AssetPackageGenerator(tk.Tk):
                 if next_texture_offset == 0:
                     last_byte_address = os.path.getsize(gpb_path)
                 else:
-                    # DO NOT trim trailing 0x5E; it can be real data
                     last_byte_address = next_texture_offset
     
                 # Extract and write bytes
                 f.seek(texture_offset)
                 img_data = f.read(last_byte_address - texture_offset)
-                
-                is_compressed = 1 if img_data[:4] == COMP_MAGIC else 0
-                compression_flags.append(is_compressed)
-    
-                output_path = os.path.join(dir_full_path, exported_filename)
-                with open(output_path, 'wb') as out_file:
-                    out_file.write(img_data)
-    
-                # Track .img outputs for later dumping
-                if output_path.lower().endswith('.img'):
-                    written_img_paths.append(output_path)
-    
-            # 2) WRITE CONFIG (path ends with .img, label ends with .png), GPB order preserved
-            config = configparser.ConfigParser()
-            config.add_section('Textures')
-    
-            for idx, filename in enumerate(extracted_filenames, start=1):
-                # label stays as original (.png)
-                label = filename.replace("\\", "/")
-    
-                # path is forced to .img when filename is .png
-                path_name = filename
-                if path_name.lower().endswith('.png'):
-                    path_name = os.path.splitext(path_name)[0] + '.img'
-    
-                full_path = os.path.join(self.destination_dir, path_name).replace("\\", "/")
-    
-                config.set('Textures', f'texture_{idx}_path', full_path)
-                config.set('Textures', f'texture_{idx}_label', label)
-                config.set('Textures', f'texture_{idx}_compression', str(compression_flags[idx-1]))
-    
-            config_file_path = os.path.join(self.destination_dir, 'gpb2_config.ini')
-            with open(config_file_path, 'w', encoding='utf-8') as config_file:
-                config.write(config_file)
-    
-        # 3) AFTER CONFIG: find all .img recursively (in case some weren’t in written_img_paths)
-        img_files = []
-        for root, _, files in os.walk(self.destination_dir):
-            for fn in files:
-                if fn.lower().endswith('.img'):
-                    img_files.append(os.path.join(root, fn))
-    
-        # Shitty ass Dialog window
-        parent = tk._default_root  # guaranteed main window
-        
-        wait_dialog = tk.Toplevel(parent)
-        wait_dialog.title("Working")
-        wait_dialog.resizable(False, False)
-        wait_dialog.transient(parent)
-        wait_dialog.grab_set()
-        
-        label = tk.Label(
-            wait_dialog,
-            text="Converting textures to PNG...\n\nPlease wait.",
-            padx=30,
-            pady=20
-        )
-        label.pack()
-        
-        # Force layout so size is calculated
-        wait_dialog.update_idletasks()
-        
-        # Center over parent window
-        x = parent.winfo_x() + (parent.winfo_width() // 2) - (wait_dialog.winfo_width() // 2)
-        y = parent.winfo_y() + (parent.winfo_height() // 2) - (wait_dialog.winfo_height() // 2)
-        wait_dialog.geometry(f"+{x}+{y}")
-        
+
+                # Detect the entry's content. A GPB holds any file: TXS3/Tex1 textures convert to an
+                # editable image; anything else is dumped verbatim under its exact label name.
+                tex_magic = peek_format_magic(img_data)
+                if tex_magic in TXS3_MAGICS:
+                    # TXS3 (PS3) -> scratch .dds, converted to a flagged image whose extension
+                    # matches the label (".dds" label -> real DDS, else PNG).
+                    scratch = os.path.join(dir_full_path, os.path.splitext(name)[0] + TXS3_EXT)
+                    with open(scratch, 'wb') as out_file:
+                        out_file.write(img_data)
+                    compression_flags.append(1 if img_data[:4] == COMP_MAGIC else 0)
+                    dump_jobs.append((scratch, extracted_filename.lower().endswith(".dds")))
+                    entry_info.append(('tex', None))
+                elif tex_magic == TEX1_MAGIC:
+                    # Tex1 (PS2) -> scratch .img, converted to PNG via GTPS2ModelTool.
+                    scratch = os.path.join(dir_full_path, os.path.splitext(name)[0] + ".img")
+                    with open(scratch, 'wb') as out_file:
+                        out_file.write(img_data)
+                    compression_flags.append(1 if img_data[:4] == COMP_MAGIC else 0)
+                    dump_jobs.append((scratch, False))
+                    entry_info.append(('tex', None))
+                    print(f"[Texture] '{name}'")
+                else:
+                    # Non-texture entry: dump verbatim, packed back as-is (compression preserved
+                    # inside the bytes, so don't re-compress -> flag 0).
+                    raw_path = os.path.join(dir_full_path, name)
+                    with open(raw_path, 'wb') as out_file:
+                        out_file.write(img_data)
+                    compression_flags.append(0)
+                    entry_info.append(('raw', raw_path))
+                    print(f"[File] '{name}'")
+
+            # Config is written AFTER the dump (below) so it can point at the format-flagged images
+            # the dumper produces (TXS3 textures gain a ".CONTAINER.FORMAT" tag).
+
+        # 3) DUMP every texture scratch file (raw passthrough entries are already final).
+        wait_dialog = self.show_progress_dialog("Converting textures...\n\nPlease wait.")
+
         # 4) MULTITHREADED DUMP + DELETE
         max_workers = min(8, (os.cpu_count() or 4))
-    
+
         errors = []
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(run_dump, p): p for p in img_files}
+            futures = {ex.submit(run_dump, scratch, as_dds): scratch for scratch, as_dds in dump_jobs}
             for fut in as_completed(futures):
+                wait_dialog.update()  # animate the progress bar as each texture finishes
                 p = futures[fut]
                 try:
                     fut.result()
@@ -1646,8 +1801,34 @@ class AssetPackageGenerator(tk.Tk):
                     errors.append((p, err))
                 except Exception as e:
                     errors.append((p, str(e)))
-    
-        # 5) DONE
+
+        # 5) WRITE CONFIG: label = original GPB name; path = the editable produced above (a flagged
+        #    image for TXS3, base.png for Tex1, a .txs/ folder for multi-texture) or the verbatim
+        #    file for non-texture entries. GPB order preserved.
+        config = configparser.ConfigParser()
+        config.add_section('Textures')
+        for idx, filename in enumerate(extracted_filenames, start=1):
+            kind, raw_path = entry_info[idx-1]
+            if kind == 'raw':
+                tex_path = raw_path
+            else:
+                base = os.path.join(self.destination_dir, os.path.splitext(safe_rel_path(filename))[0])
+                txs_folder = base + ".txs"
+                if os.path.isdir(txs_folder):
+                    tex_path = txs_folder
+                else:
+                    matches = glob.glob(glob.escape(base) + ".*.png") + glob.glob(glob.escape(base) + ".*.dds")
+                    if not matches and os.path.exists(base + ".png"):
+                        matches = [base + ".png"]
+                    tex_path = matches[0] if matches else base + ".png"
+            config.set('Textures', f'texture_{idx}_path', tex_path.replace("\\", "/"))
+            config.set('Textures', f'texture_{idx}_label', filename.replace("\\", "/"))
+            config.set('Textures', f'texture_{idx}_compression', str(compression_flags[idx-1]))
+        config_file_path = os.path.join(self.destination_dir, 'gpb2_config.ini')
+        with open(config_file_path, 'w', encoding='utf-8') as config_file:
+            config.write(config_file)
+
+        # 6) DONE
         wait_dialog.destroy()
         if errors:
             print("GTPS2ModelTool errors:")
@@ -1666,47 +1847,79 @@ class AssetPackageGenerator(tk.Tk):
         if not self.destination_dir:
             messagebox.showerror("Error", "No destination directory selected.")
             return
-                
+
         import struct
-        
-        # Define a variable to store the number of textures
-        num_textures = None  # Initialize with None or any default value
-    
+
+        def safe_rel_path(label):
+            # Keep files INSIDE destination_dir: strip drive letters, leading
+            # slashes, and any '.'/'..' components (GT PS3 labels use ../../../).
+            s = label.replace("\\", "/")
+            parts = [p for p in s.split("/") if p not in ("", ".", "..") and ":" not in p]
+            return os.path.join(*parts) if parts else "_unnamed_"
+
+        def run_dump(tex_path: str, as_dds: bool = False):
+            # GPB3 textures are TXS3. Platform comes from the magic byte order:
+            # "TXS3" (big-endian) = PS3, "3SXT" (little-endian) = PSP. Decompress
+            # first if ps2zip-compressed, then convert TXS3 -> PNG (or -> DDS when the
+            # original label was a .dds, so PS3 DXT textures round-trip losslessly).
+            try:
+                with open(tex_path, "rb") as fh:
+                    magic = fh.read(4)
+            except Exception as e:
+                raise RuntimeError(f"Failed reading magic for: {tex_path}\n{e}")
+
+            convert_input = tex_path
+            decompressed_path = None
+            if magic == COMP_MAGIC:
+                subprocess.run([zip_exe, tex_path], capture_output=True, text=True, check=True)
+                decompressed_path = tex_path + "_decompressed"
+                convert_input = decompressed_path
+                if not os.path.isfile(decompressed_path):
+                    raise RuntimeError(f"PolyphonyPS2Zip did not produce expected output:\n{decompressed_path}")
+                with open(decompressed_path, "rb") as fh:
+                    magic = fh.read(4)
+
+            fmt = "PSP" if magic == b"3SXT" else "PS3"
+            # PSP (3SXT/Tpp1) has no DDS equivalent, so --dds is PS3-only (the converter also
+            # ignores it for non-Cell textures, but skip it here so PSP dumps stay PNG).
+            cmd = [TEXTURESETCONVERTER_EXE, "convert-png", "-i", convert_input, "-f", fmt]
+            if as_dds and fmt == "PS3":
+                cmd.append("--dds")
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+            try:
+                if os.path.isfile(tex_path):
+                    os.remove(tex_path)
+            except Exception as e:
+                print(f"[Cleanup] Failed to delete original texture: {tex_path}\n  {e}")
+            if decompressed_path:
+                try:
+                    if os.path.isfile(decompressed_path):
+                        os.remove(decompressed_path)
+                except Exception as e:
+                    print(f"[Cleanup] Failed to delete decompressed: {decompressed_path}\n  {e}")
+
         with open(gpb_path, 'rb') as f:
-            # Step 1: Read the number of textures
-            f.seek(0x0000000C)  # Seek to the address for texture count
-            texture_count_bytes = f.read(4)  # Read 4 bytes
-                
-            # Unpack the bytes to get the integer value
-            texture_count = struct.unpack('>I', texture_count_bytes)[0]
-            
-            # Store the texture_count value in num_textures
-            num_textures = texture_count
-            print(f"Number of textures: {num_textures}")  # Debugging
-                
-            # List to hold metadata
-            filename_offsets = []
-            texture_offsets = []
-            next_texture_offsets = []
-            
-            # Step 1.1: Calculate byte range for texture metadata
+            # Texture count (PS3 gpb3 is big-endian)
+            f.seek(0x0000000C)
+            num_textures = struct.unpack('>I', f.read(4))[0]
+            print(f"Number of textures: {num_textures}")
+
+            # Metadata: 16 bytes per texture starting at 0x20
             metadata_start = 0x00000020
-            metadata_end = int(metadata_start) + (16 * int(num_textures))
-            print(f"Metadata start: {metadata_start}, Metadata end: {metadata_end}")
-            
-            # Step 1.2: Read texture metadata
+            metadata_end = metadata_start + (16 * int(num_textures))
             f.seek(metadata_start)
             metadata = f.read(metadata_end - metadata_start)
-            print(f"Metadata length: {len(metadata)}")  # Debugging
-            
-            # List to hold extracted filenames
+
             extracted_filenames = []
-            # Step 2 & 3: Process each texture metadata chunk
+            tex_dumps = []    # (scratch TXS3-binary path, dump-as-dds?) per texture entry
+            entry_info = []   # ('tex', None) or ('raw', raw_path) per entry, in GPB order
+
             for i in range(num_textures):
                 filename_offset = int.from_bytes(metadata[i*16:i*16+4], byteorder='big')
-                texture_offset = int.from_bytes(metadata[i*16+4:i*16+8], byteorder='big')
-                
-                # Extract filename from the given offset
+                texture_offset  = int.from_bytes(metadata[i*16+4:i*16+8], byteorder='big')
+
+                # Read label string
                 f.seek(filename_offset)
                 filename_bytes = bytearray()
                 while True:
@@ -1714,65 +1927,90 @@ class AssetPackageGenerator(tk.Tk):
                     if byte == b'\x00':
                         break
                     filename_bytes.append(byte[0])
-                    
                 extracted_filename = filename_bytes.decode('utf-8')
-                extracted_filenames.append(extracted_filename)  # Store the extracted filename in the list
-                # Create directories if they don't exist
-                dir_path = os.path.dirname(extracted_filename)
-                dir_full_path = f"{self.destination_dir}{dir_path}"
-                if not os.path.exists(dir_full_path):
-                    os.makedirs(dir_full_path)
-            
-                # Determine exported filename
-                exported_filename = os.path.basename(extracted_filename) + '.img'
-            
-                # Determine byte range for texture data
+                extracted_filenames.append(extracted_filename)
+
+                # Output dir (sanitized so ../../../ labels stay inside destination_dir)
+                rel_path = safe_rel_path(extracted_filename)
+                dir_full_path = os.path.join(self.destination_dir, os.path.dirname(rel_path))
+                os.makedirs(dir_full_path, exist_ok=True)
+                base = os.path.basename(rel_path)
+
+                # Byte range for texture data (trim trailing 0x5E padding before next texture)
                 next_texture_offset = int.from_bytes(metadata[i*16+20:i*16+24], byteorder='big')
-                
-                print(f"--------")
-                print(f"Texture# {i+1}: `{extracted_filename}`")
-                print(f"Extracting to: {dir_full_path}{exported_filename}")
-                print(f"Label offset: {filename_offset}")  # Debugging
-                print(f"1st byte: {texture_offset}")  # Debugging
-                
-                # Break out of the loop if next_texture_offset is 0
                 if next_texture_offset == 0:
                     last_byte_address = os.path.getsize(gpb_path)
-                    print(f"Last byte: [END OF FILE]")  # Debugging
                 else:
                     f.seek(next_texture_offset - 1)
                     while f.read(1) == b'\x5E':
                         next_texture_offset -= 1
                         f.seek(next_texture_offset - 1)
                     last_byte_address = next_texture_offset
-                    print(f"Last byte: {next_texture_offset}")  # Debugging
-                        
+
                 f.seek(texture_offset)
-                img_data = f.read((last_byte_address) - texture_offset)
-            
-                output_path = os.path.join(dir_full_path, exported_filename)
-                with open(output_path, 'wb') as out_file:
-                    out_file.write(img_data)
-                    
-            print(f"--------")
-            print(f"GPB extraction completed. {num_textures} textures extracted.")
-                
+                img_data = f.read(last_byte_address - texture_offset)
+
+                # A GPB can hold any file. Convert only recognized texture containers; dump anything
+                # else verbatim under its exact label name (raw passthrough).
+                magic = _peek_magic(img_data, self.destination_dir)
+                if magic in TEX_MAGICS_GPB3:
+                    # Scratch TXS3 binary -> a flagged editable image whose extension matches the
+                    # label (".dds" label -> real DDS for lossless DXT, anything else -> PNG).
+                    scratch = os.path.join(dir_full_path, os.path.splitext(base)[0] + TXS3_EXT)
+                    with open(scratch, 'wb') as out_file:
+                        out_file.write(img_data)
+                    as_dds = extracted_filename.lower().endswith(".dds")
+                    tex_dumps.append((scratch, as_dds))
+                    entry_info.append(('tex', None))
+                    print(f"Texture# {i+1}: '{extracted_filename}' -> {scratch}")
+                else:
+                    raw_path = os.path.join(dir_full_path, base)
+                    with open(raw_path, 'wb') as out_file:
+                        out_file.write(img_data)
+                    entry_info.append(('raw', raw_path))
+                    print(f"File#    {i+1}: '{extracted_filename}' -> {raw_path} (raw passthrough)")
+
+            # Convert every extracted TXS3/Tpp1 texture to a (format-flagged) PNG/DDS first. The
+            # converter appends the container + pixel format to the filename, e.g.
+            # "cobra_67.3SXT.IDTEX8.png" / "custom_22.TXS3.DXT1.dds", so the rebuild reproduces
+            # them exactly.
+            wait_dialog = self.show_progress_dialog("Converting textures...\n\nPlease wait.")
+            try:
+                for t, as_dds in tex_dumps:
+                    wait_dialog.update()  # animate the progress bar between textures
+                    run_dump(t, as_dds)
+            finally:
+                wait_dialog.destroy()
+
+            # Write config: label = original GPB name; path = the flagged PNG/DDS produced above.
+            # The filename flag carries container + pixel format, so no [GPB] platform is needed.
             config = configparser.ConfigParser()
             config.add_section('Textures')
-            
             for i, filename in enumerate(extracted_filenames):
-                full_path = os.path.join(self.destination_dir, filename + '.img')
-                full_path = full_path.replace("\\", "/")
-                
-                config.set('Textures', f'texture_{i+1}_path', full_path)
+                kind, raw_path = entry_info[i]
+                if kind == 'raw':
+                    # Non-texture entry: the verbatim file IS the build input (packed back as-is).
+                    tex_path = raw_path
+                else:
+                    base = os.path.join(self.destination_dir, os.path.splitext(safe_rel_path(filename))[0])
+                    # A multi-texture TXS3 (e.g. env2.txs) dumps into a "<base>.txs/" FOLDER of
+                    # sub-texture images; point the config at the folder (convert-img rebuilds it).
+                    txs_folder = base + ".txs"
+                    if os.path.isdir(txs_folder):
+                        tex_path = txs_folder
+                    else:
+                        # The flagged image keeps the label's extension (.dds dump or .png dump).
+                        matches = glob.glob(glob.escape(base) + ".*.png") + glob.glob(glob.escape(base) + ".*.dds")
+                        tex_path = matches[0] if matches else base + ".png"
+                config.set('Textures', f'texture_{i+1}_path', tex_path.replace("\\", "/"))
                 config.set('Textures', f'texture_{i+1}_label', filename)
-            
             config_file_path = os.path.join(self.destination_dir, 'gpb3_config.ini')
-            with open(config_file_path, 'w') as config_file:
+            with open(config_file_path, 'w', encoding='utf-8') as config_file:
                 config.write(config_file)
-            
+
+            print(f"GPB extraction completed. {num_textures} textures extracted.")
             messagebox.showinfo("Success!", f"GPB extraction completed. {num_textures} textures extracted.")
-            
+
     def ask_root_folder_and_generate(self):
         root_folder = filedialog.askdirectory(title="Select Root Folder")
         
@@ -1795,24 +2033,27 @@ class AssetPackageGenerator(tk.Tk):
                     continue # Skip
     
                 rel_dir = os.path.relpath(root, root_folder)
-    
-                # Label stays .png
-                if rel_dir == ".":
-                    label = file_name
+
+                # Work out the GPB label and the on-disk data path for this file.
+                parts = file_name.split('.')
+                flagged = len(parts) >= 4 and parts[-3] in ("TXS3", "3SXT", "Tpp1")
+                if flagged:
+                    # ".CONTAINER.FORMAT" flagged texture (e.g. custom_22.TXS3.DXT1.dds): the label
+                    # drops the flag but KEEPS the real extension the texture had in the GPB
+                    # (custom_22.dds / custom_22.png). The build reads the flagged file directly.
+                    label_name = ".".join(parts[:-3]) + "." + parts[-1]
+                    path_name = file_name
+                elif file_name.lower().endswith('.png'):
+                    # Tex1 (PS2): label keeps .png, the packed data is the .img beside it.
+                    label_name = file_name
+                    path_name = os.path.splitext(file_name)[0] + ".img"
                 else:
-                    label = os.path.join(rel_dir, file_name)
-    
-                label = label.replace("\\", "/")
-    
-                # Tex1's will be .img (same name, different extension)
-                if file_name.lower().endswith('.png'):
-                    img_name = os.path.splitext(file_name)[0] + ".img"
-                    abs_path = os.path.abspath(os.path.join(root, img_name))
-                    abs_path = abs_path.replace("\\", "/")
-                else:
-                    abs_path = os.path.abspath(os.path.join(root, file_name))
-                    abs_path = abs_path.replace("\\", "/")
-    
+                    label_name = file_name
+                    path_name = file_name
+
+                label = (label_name if rel_dir == "." else os.path.join(rel_dir, label_name)).replace("\\", "/")
+                abs_path = os.path.abspath(os.path.join(root, path_name)).replace("\\", "/")
+
                 entries.append((label, abs_path))
     
         # Strict ASCII lexicographic order (by label)
@@ -1837,4 +2078,3 @@ class AssetPackageGenerator(tk.Tk):
 if __name__ == "__main__":
     app = AssetPackageGenerator()
     app.mainloop()
-
