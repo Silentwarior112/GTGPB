@@ -27,7 +27,7 @@ How to use:
 2. Download the required external tools:
 	- [GTPS2ModelTool 1.1.0 or newer](https://github.com/Nenkai/GTPS2ModelTool/releases)
 	- [PolyphonyPS2Zip](https://github.com/pez2k/gt2tools/releases/tag/PolyphonyPS2Zip01)
-	- [TXS3 Converter]()
+	- Version 1.2.0 uses [This fork of TXS3Converter](https://github.com/Silentwarior112/TXS3Converter/releases/tag/1.3.1)
 	- The Microsoft dotnet frameworks that PolyphonyPS2Zip, GTPS2ModelTool, and TXS3 Converter require to run. (5.0, 8.0, 9.0)
 
 3. Place the tools in the corresponding folders to complete the installation.
