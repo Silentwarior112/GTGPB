@@ -89,8 +89,8 @@ Generating a .gpb:
 
 
 Supported gpb formats:
-gpb0: GT4 Prologue NTSC-J (PBPX-95523)
-gpb1: GT4 Prologue PAL (SCES-52438), GT4 First Preview (NTSC-J) (PCPX-96649)
-gpb2 (PS2): All retail releases of GT4, GT4 MX-5 Demo, Tourist Trophy
-gpb2 (PS3): GT HD, GT5 prologue
-gpb3: GTPSP, GT5, GT6
+gpb0: GT4 Prologue NTSC-J (PBPX-95523) <br>
+gpb1: GT4 Prologue PAL (SCES-52438), GT4 First Preview (NTSC-J) (PCPX-96649) <br>
+gpb2 (PS2): All retail releases of GT4, GT4 MX-5 Demo, Tourist Trophy <br>
+gpb2 (PS3): GT HD, GT5 prologue <br>
+gpb3: GTPSP, GT5, GT6 <br>
